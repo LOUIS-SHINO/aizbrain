@@ -202,7 +202,9 @@ pub fn validate_path_under_root(root: &Path, relative: &Path) -> Result<PathBuf,
         current.push(name);
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
-                if is_reparse_or_symlink(&current, &metadata) || is_hidden(&current) {
+                if is_reparse_or_symlink(&current, &metadata)
+                    || disallowed_hidden_component(&current, index, metadata.is_dir())
+                {
                     return Err(NativeError::UnsafePath);
                 }
                 let is_last = index + 1 == components.len();
@@ -237,7 +239,7 @@ pub fn prepare_path_for_create(root: &Path, relative: &Path) -> Result<PathBuf, 
     validate_relative_path(relative)?;
     let parent = relative.parent().ok_or(NativeError::UnsafePath)?;
     let mut current = canonical_root.clone();
-    for component in parent.components() {
+    for (index, component) in parent.components().enumerate() {
         let Component::Normal(name) = component else {
             return Err(NativeError::UnsafePath);
         };
@@ -246,7 +248,7 @@ pub fn prepare_path_for_create(root: &Path, relative: &Path) -> Result<PathBuf, 
             Ok(metadata) => {
                 if !metadata.is_dir()
                     || is_reparse_or_symlink(&current, &metadata)
-                    || is_hidden(&current)
+                    || disallowed_hidden_component(&current, index, metadata.is_dir())
                 {
                     return Err(NativeError::UnsafePath);
                 }
@@ -256,7 +258,7 @@ pub fn prepare_path_for_create(root: &Path, relative: &Path) -> Result<PathBuf, 
                 let metadata = fs::symlink_metadata(&current)?;
                 if !metadata.is_dir()
                     || is_reparse_or_symlink(&current, &metadata)
-                    || is_hidden(&current)
+                    || disallowed_hidden_component(&current, index, metadata.is_dir())
                 {
                     return Err(NativeError::UnsafePath);
                 }
@@ -772,7 +774,10 @@ fn is_technical_name(name: &str) -> bool {
 /// the AI handoff folder `.ai/`, the template folders `模板/`, `90-模板/` and
 /// `Templates/` (English vaults), and the root entry files `CLAUDE.md`,
 /// `AGENTS.md`, `GEMINI.md` and `QWEN.md`. These are exact literal
-/// names (no wildcards); every other traversal/symlink/hidden check still applies.
+/// names (no wildcards). Traversal, root containment and symlink checks still
+/// apply. Hidden components stay rejected too, except the vault-root `.ai`
+/// directory: on macOS and Linux that name is hidden, and rejecting it makes
+/// Build architecture fail with `UnsafePath`.
 fn is_managed_component(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -805,6 +810,28 @@ fn newline_style(bytes: &[u8]) -> NewlineStyle {
     } else {
         NewlineStyle::Mixed
     }
+}
+
+/// Hidden, and not the one directory the app is allowed to create anyway.
+///
+/// `is_hidden` on macOS and Linux is the leading-dot convention, so `.ai` is
+/// always hidden there. `validate_relative_path` already permits that managed
+/// name. The walk permits it only when it is a real directory and a direct
+/// child of the vault root. A nested `.ai`, any other dot-directory, a hidden
+/// file, and a `.ai` symlink are not exempt. On Windows the hidden attribute
+/// is separate from the name; a vault-root `.ai` directory that also has that
+/// attribute is the same managed folder.
+fn disallowed_hidden_component(path: &Path, index: usize, is_dir: bool) -> bool {
+    if !is_hidden(path) {
+        return false;
+    }
+    let managed_root_ai = index == 0
+        && is_dir
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(".ai"));
+    !managed_root_ai
 }
 
 fn is_hidden(path: &Path) -> bool {

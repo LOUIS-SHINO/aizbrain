@@ -935,3 +935,184 @@ fn gemini_and_qwen_entry_files_are_managed_like_claude_and_agents() {
     let scanned = scan_markdown(&root, ScanLimits::default(), &|| false).unwrap();
     assert!(scanned.files.is_empty());
 }
+
+/// Build architecture writes `.ai/INSTRUCTIONS.md` and `.ai/INDEX.md`. On macOS
+/// and Linux that directory is hidden by name, so the create and later rewrite
+/// walks must accept the vault-root `.ai` folder and still skip it while scanning.
+#[test]
+fn managed_ai_directory_accepts_new_and_existing_markdown_writes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("vault");
+    fs::create_dir(&root).unwrap();
+    let canonical = root.canonicalize().unwrap();
+
+    let instructions = prepare_path_for_create(&root, Path::new(".ai/INSTRUCTIONS.md")).unwrap();
+    assert_eq!(instructions, canonical.join(".ai").join("INSTRUCTIONS.md"));
+    assert!(canonical.join(".ai").is_dir());
+    assert!(!instructions.exists());
+    fs::write(&instructions, b"# instructions\n").unwrap();
+    assert_eq!(
+        validate_path_under_root(&root, Path::new(".ai/INSTRUCTIONS.md")).unwrap(),
+        instructions
+    );
+
+    // `.ai` already exists. Creating the index, then rewriting it, is the
+    // second half of a scaffold and of every later index refresh.
+    let index = prepare_path_for_create(&root, Path::new(".ai/INDEX.md")).unwrap();
+    fs::write(&index, b"# index\n").unwrap();
+    fs::write(&index, b"# index v2\n").unwrap();
+    assert_eq!(
+        validate_path_under_root(&root, Path::new(".ai/INDEX.md")).unwrap(),
+        index
+    );
+
+    let worklog = prepare_path_for_create(&root, Path::new(".ai/worklog/2026-11.md")).unwrap();
+    assert!(canonical.join(".ai").join("worklog").is_dir());
+    fs::write(&worklog, b"# log\n").unwrap();
+    assert!(validate_path_under_root(&root, Path::new(".ai/worklog/2026-11.md")).is_ok());
+
+    // The managed-name check is case-insensitive, matching `is_managed_component`.
+    let upper = prepare_path_for_create(&root, Path::new(".AI/NOTES.md")).unwrap();
+    fs::write(&upper, b"# notes\n").unwrap();
+    assert!(validate_path_under_root(&root, Path::new(".AI/NOTES.md")).is_ok());
+
+    fs::create_dir(root.join("notes")).unwrap();
+    fs::write(root.join("notes").join("task.md"), b"# task\n").unwrap();
+    let scanned = scan_markdown(&root, ScanLimits::default(), &|| false).unwrap();
+    let paths: Vec<_> = scanned
+        .files
+        .iter()
+        .map(|file| file.relative_path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    assert_eq!(paths, vec!["notes/task.md".to_owned()]);
+}
+
+/// The `.ai` exemption is the directory at the vault root only. Escapes,
+/// symlinks, and every other hidden path stay `UnsafePath`, and a rejected
+/// create must not write outside the vault.
+#[test]
+fn managed_ai_allowance_rejects_escape_symlink_and_unrelated_hidden_paths() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("vault");
+    let outside = dir.path().join("outside");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret.md"), b"secret").unwrap();
+
+    for path in [
+        "../secret.md",
+        "../../secret.md",
+        ".ai/../secret.md",
+        ".ai/../../secret.md",
+        ".ai/INSTRUCTIONS.md/../secret.md",
+        "/tmp/secret.md",
+        "C:/secret.md",
+        ".ai/..\\secret.md",
+    ] {
+        assert!(
+            prepare_path_for_create(&root, Path::new(path)).is_err(),
+            "create {path}"
+        );
+        assert!(
+            validate_path_under_root(&root, Path::new(path)).is_err(),
+            "validate {path}"
+        );
+    }
+    assert_eq!(fs::read(outside.join("secret.md")).unwrap(), b"secret");
+    assert!(
+        !root.join(".ai").exists(),
+        "a rejected escape must not create .ai"
+    );
+
+    fs::create_dir_all(root.join(".ai").join(".nested")).unwrap();
+    fs::write(root.join(".ai").join(".nested").join("note.md"), b"hidden").unwrap();
+    fs::create_dir_all(root.join(".ai").join(".ai")).unwrap();
+    fs::write(root.join(".ai").join(".ai").join("INDEX.md"), b"nested").unwrap();
+    fs::create_dir_all(root.join("notes").join(".hidden")).unwrap();
+    fs::write(
+        root.join("notes").join(".hidden").join("note.md"),
+        b"hidden",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("notes").join(".ai")).unwrap();
+    fs::write(root.join("notes").join(".ai").join("INDEX.md"), b"nested").unwrap();
+    fs::create_dir_all(root.join(".secret")).unwrap();
+    fs::write(root.join(".secret").join("note.md"), b"hidden").unwrap();
+    fs::create_dir_all(root.join(".obsidian")).unwrap();
+    fs::write(root.join(".obsidian").join("config.md"), b"hidden").unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("config.md"), b"hidden").unwrap();
+
+    for path in [
+        ".secret/note.md",
+        ".obsidian/config.md",
+        ".git/config.md",
+        "notes/.hidden/note.md",
+        "notes/.ai/INDEX.md",
+        ".ai/.nested/note.md",
+        ".ai/.ai/INDEX.md",
+        ".ai/.secret/note.md",
+    ] {
+        assert!(
+            prepare_path_for_create(&root, Path::new(path)).is_err(),
+            "create {path}"
+        );
+        assert!(
+            validate_path_under_root(&root, Path::new(path)).is_err(),
+            "validate {path}"
+        );
+    }
+    assert!(
+        !root.join(".ai").join(".secret").exists(),
+        "a rejected nested hidden path must not be created"
+    );
+    // The real vault-root files stay writable after those rejections.
+    assert!(prepare_path_for_create(&root, Path::new(".ai/INSTRUCTIONS.md")).is_ok());
+    assert!(validate_path_under_root(&root, Path::new("notes/.hidden/note.md")).is_err());
+
+    let hidden_root = dir.path().join(".hidden-vault");
+    fs::create_dir(&hidden_root).unwrap();
+    assert!(validate_vault_root(&hidden_root).is_err());
+    assert!(prepare_path_for_create(&hidden_root, Path::new("note.md")).is_err());
+    let ai_as_root = dir.path().join(".ai");
+    fs::create_dir(&ai_as_root).unwrap();
+    assert!(validate_vault_root(&ai_as_root).is_err());
+    assert!(prepare_path_for_create(&ai_as_root, Path::new("INDEX.md")).is_err());
+
+    let file_root = dir.path().join("file-ai");
+    fs::create_dir(&file_root).unwrap();
+    fs::write(file_root.join(".ai"), b"not a directory").unwrap();
+    assert!(prepare_path_for_create(&file_root, Path::new(".ai/INDEX.md")).is_err());
+    assert!(validate_path_under_root(&file_root, Path::new(".ai/INDEX.md")).is_err());
+
+    #[cfg(unix)]
+    {
+        let linked = dir.path().join("linked");
+        fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(&outside, linked.join(".ai")).unwrap();
+        assert!(prepare_path_for_create(&linked, Path::new(".ai/INSTRUCTIONS.md")).is_err());
+        assert!(validate_path_under_root(&linked, Path::new(".ai/secret.md")).is_err());
+        assert!(!outside.join("INSTRUCTIONS.md").exists());
+        assert!(fs::symlink_metadata(linked.join(".ai"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        fs::remove_file(linked.join(".ai")).unwrap();
+        fs::create_dir(linked.join(".ai")).unwrap();
+        std::os::unix::fs::symlink(&outside, linked.join(".ai").join("escape")).unwrap();
+        assert!(prepare_path_for_create(&linked, Path::new(".ai/escape/note.md")).is_err());
+        assert!(validate_path_under_root(&linked, Path::new(".ai/escape/note.md")).is_err());
+        assert!(!outside.join("note.md").exists());
+        assert_eq!(fs::read(outside.join("secret.md")).unwrap(), b"secret");
+
+        std::os::unix::fs::symlink(
+            outside.join("secret.md"),
+            linked.join(".ai").join("INDEX.md"),
+        )
+        .unwrap();
+        assert!(validate_path_under_root(&linked, Path::new(".ai/INDEX.md")).is_err());
+        assert!(prepare_path_for_create(&linked, Path::new(".ai/INDEX.md")).is_err());
+        assert_eq!(fs::read(outside.join("secret.md")).unwrap(), b"secret");
+    }
+}
